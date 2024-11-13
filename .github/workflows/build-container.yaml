@@ -1,0 +1,115 @@
+name: Build container
+on:
+  push:
+    branches:
+      - gh-pages
+  workflow_dispatch:
+
+env:
+  # Use docker.io for Docker Hub if empty
+  REGISTRY: ghcr.io
+  # github.repository as <account>/<repo>
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  extract-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.extract_version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 1
+          ref: gh-pages
+      - name: Extract version
+        id: extract_version
+        run: |
+          apt update -y && apt install -y jq
+          echo ::set-output name=version::$(jq -r '.version' update.json)
+
+  build:
+    runs-on: ubuntu-latest
+    needs: extract-version
+    steps:
+      - name: Download KeeWeb
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 1
+          ref: gh-pages
+          path: Pages
+      - name: Download Build
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 1
+          ref: master
+          path: Build
+      - name: Log into registry ${{ env.REGISTRY }}
+        uses: docker/login-action@28218f9b04b4f3f62068d7b6ce6ca5b26e35336c
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Process repository name
+        run: echo "IMAGE_PATH=${REGISTRY}/${IMAGE_NAME@L}" >> $GITHUB_ENV
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_PATH }}
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./Pages
+          file: ./Build/Dockerfile
+          push: true
+          tags: ${{ env.IMAGE_PATH }}:${{ needs.extract-version.outputs.version }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  publish:
+    needs:
+      - build
+      - extract-version
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Build
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 1
+          ref: master
+
+      - name: Configure Git
+        run: |
+          git config user.name "$GITHUB_ACTOR"
+          git config user.email "$GITHUB_ACTOR@users.noreply.github.com"
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        env:
+          GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+
+      - name: Update Helm Chart Version
+        working-directory: chart/keeweb
+        run: |
+          # The current version is stored in inputs.tag, we need to rewrite the charts.yaml file with the new version
+          # However we can only replace the version: property if it is at the start of a line
+          echo "Updating Chart.yaml version to ${{ needs.extract-version.outputs.version }}"
+          sed -i "s/^version: \(.*\)/version: ${{ needs.extract-version.outputs.version }}/g" Chart.yaml
+
+          # Now this inserted a version with a v prefix, we need to remove only that initial v
+          sed -i "1s/version: v\(.*\)/version: \1/g" Chart.yaml
+
+      - name: Add Bitnami chart repository
+        run: helm repo add bitnami https://charts.bitnami.com/bitnami
+
+      - name: Install chart dependencies
+        run: helm dependency update chart/keeweb
+
+      - name: Run chart-releaser
+        uses: helm/chart-releaser-action@v1.6.0
+        with:
+          charts_dir: 'chart'
+          pages_branch: 'chart-publications'
+        env:
+          CR_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+
